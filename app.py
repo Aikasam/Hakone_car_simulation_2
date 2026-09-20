@@ -16,7 +16,7 @@ from data_io.sheets_manager import (
     save_plan_to_sheet,
 )
 from logic.milp_allocator_v3 import generate_full_plan_cpsat, DEFAULT_TIME_LIMIT
-from logic.back_sim import BackSimConfig, run_back_sim, summarize_conditions
+from logic.back_sim import BackSimConfig, run_back_sim, summarize_conditions, check_priority_sections
 from logic.car_pool import section_label, LARGE_CAR_IDS, NORMAL_CAR_IDS
 from data_io.output_writer import write_plan_xlsx, SECTION_COLORS
 from data_io.plan_importer import (
@@ -378,6 +378,14 @@ def _render_back_sim_section():
         st.info("裏シュミを実行するには、上で入力元を指定してください。")
         return
 
+    _, unmet_priority = check_priority_sections(plan, participants)
+    if unmet_priority:
+        names = "、".join(
+            f"{participants[p].name}（{s}区）"
+            for p, s in sorted(unmet_priority, key=lambda x: x[1])
+        )
+        st.warning(f"⚠️ 「特に走りたい区間」が未充足の人がいます: {names}　→ 裏シュミ実行時に優先的に直します。")
+
     # 学年順(同学年内は名前順)に並べる。一括選択(学年ボタン)にも使う。
     participants_sorted = sorted(participants.values(), key=lambda p: (p.grade, p.name))
     participant_names = [p.name for p in participants_sorted]
@@ -502,11 +510,14 @@ def _render_back_sim_section():
         )
 
         has_any_condition = bool(together_pairs or together_or_groups or apart_pairs or driver_ranges)
-        run_back = st.button(
-            "裏シュミを実行",
-            type="primary",
-            help=None if has_any_condition else "条件が指定されていないため、再計算せずそのまま結果を表示します（区間別配車の表の確認などに）。",
-        )
+        needs_optimization = has_any_condition or bool(unmet_priority)
+        if has_any_condition:
+            run_help = None
+        elif unmet_priority:
+            run_help = "条件は指定されていませんが、「特に走りたい区間」の未充足を直すために再計算します。"
+        else:
+            run_help = "条件が指定されていないため、再計算せずそのまま結果を表示します（区間別配車の表の確認などに）。"
+        run_back = st.button("裏シュミを実行", type="primary", help=run_help)
 
     if run_back:
         back_log_buf = io.StringIO()
@@ -514,8 +525,8 @@ def _render_back_sim_section():
             together_pairs=together_pairs, apart_pairs=apart_pairs, driver_ranges=driver_ranges,
             together_or_groups=together_or_groups,
         )
-        if not has_any_condition:
-            back_log_buf.write("条件が指定されていないため、計算をせずに読み込んだ結果をそのまま表示します。\n")
+        if not needs_optimization:
+            back_log_buf.write("条件が指定されておらず、「特に走りたい区間」も充足済みのため、計算をせずに読み込んだ結果をそのまま表示します。\n")
             back_plan = plan
             write_plan_xlsx(back_plan, participants, BACK_OUTPUT_XLSX_PATH)
             condition_summary = summarize_conditions(back_plan, participants, config)
@@ -565,8 +576,20 @@ def _render_back_sim_section():
         st.markdown("#### 裏シュミの結果")
 
         summary = back_result.get("summary", {})
-        if summary.get("together") or summary.get("together_or") or summary.get("apart") or summary.get("driver_ranges"):
+        has_any_summary = any(
+            summary.get(k) for k in ("together", "together_or", "apart", "driver_ranges", "priority_sections")
+        )
+        if has_any_summary:
             st.markdown("**条件の充足状況**")
+            if summary.get("priority_sections"):
+                st.caption("特に走りたい区間（表シュミ側の希望。裏シュミの新条件より優先して充足を試みます）")
+                st.dataframe(
+                    pd.DataFrame([
+                        {"名前": d["name"], "区間": f"{d['section_id']}区", "充足": "✅" if d["satisfied"] else "❌"}
+                        for d in summary["priority_sections"]
+                    ]),
+                    hide_index=True, use_container_width=True, key="back_summary_priority_sections",
+                )
             if summary.get("together"):
                 st.caption("できるだけ一緒にしたい（同乗できた区間数）")
                 st.dataframe(

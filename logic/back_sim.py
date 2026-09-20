@@ -53,6 +53,14 @@ W_STAY_CLOSE = 20  # 表シュミの結果から変えないことへの誘導(�
 # なることがあった(実際に確認済み)。下限未達成の人にはどのフェーズでも運転を積極的に
 # 割り振るよう、ハード制約とは別にソフトな誘導も加える。
 W_DRIVER_MIN_PUSH = 1000
+# 「特に走りたい区間」は表シュミ側の目的関数(W_PRIORITY_RUNNER_PREF)に既に組み込まれて
+# いるが、それだけだと「表シュミ以降に入力データが編集されて新たに追加された優先区間」
+# のような、土台の時点で未充足だったものを裏シュミが確実に拾って直しにいく保証がない
+# (元の割り当てへのヒントが探索を古い解に引っ張るため、時間制限内では変化が起きない
+# ことがある)。そこで、ユーザーが指定した条件の有無に関わらず常に「土台の時点で未充足の
+# 優先区間」を検出し、それをこの重みで強く後押しする。裏シュミ自身の新条件(W_TOGETHER等)
+# より優先されるべきなので、それらより明確に大きい値にしている。
+W_PRIORITY_FIX_PUSH = 1000
 
 
 class BackSimConfig:
@@ -128,6 +136,27 @@ def _baseline_occupancy(plan: List[SectionState]):
             for pid in car.passenger_ids:
                 occ.add((pid, car.car_id, section.section_id))
     return occ, runner_by_section
+
+
+def check_priority_sections(plan: List[SectionState], participants: Dict[str, Participant]):
+    """「特に走りたい区間」ごとに、planで実際にその人がその区間を走れているかを調べる。
+    表シュミ・裏シュミどちらの結果に対しても使える(裏シュミでは、実行前の土台に対して
+    「直すべき未充足が無いか」を調べるのにも、実行後の結果に対して「直せたか」を
+    確認するのにも使う)。
+    戻り値: (詳細のリスト[{"name","section_id","satisfied"}], 未充足の(participant_id, section_id)集合)
+    """
+    _, runner_by_section = _baseline_occupancy(plan)
+    details = []
+    unmet = set()
+    for pid, p in participants.items():
+        for s in range(1, 11):
+            if not p.priority_sections[s - 1]:
+                continue
+            satisfied = pid in runner_by_section.get(s, set())
+            details.append({"name": p.name, "section_id": s, "satisfied": satisfied})
+            if not satisfied:
+                unmet.add((pid, s))
+    return details, unmet
 
 
 def _apply_hints(model, var_dict: dict, baseline_keys: set) -> None:
@@ -231,6 +260,14 @@ def run_back_sim(
     last_block_for = {p: _last_present_block(participants, p) for p in driver_ranges}
     driven_so_far: Dict[str, int] = {p: 0 for p in driver_ranges}
 
+    _, unmet_priority_keys = check_priority_sections(baseline_plan, participants)
+    if unmet_priority_keys:
+        names = ", ".join(f"{participants[p].name}:{s}区" for p, s in sorted(unmet_priority_keys, key=lambda x: x[1]))
+        print(f"[裏シュミ] 土台の時点で未充足の「特に走りたい区間」を検出、優先的に直します: {names}")
+
+    def priority_fix_terms(runs: Dict[Tuple[str, int], object]) -> list:
+        return [-W_PRIORITY_FIX_PUSH * v for (p, s), v in runs.items() if (p, s) in unmet_priority_keys]
+
     def apply_driver_range_constraints(model, drive_terms_by_person: Dict[str, list], block_name: str):
         for p, terms_p in drive_terms_by_person.items():
             if p not in driver_ranges or not terms_p:
@@ -268,6 +305,7 @@ def run_back_sim(
                                      ctx["car_ids"], ctx["sections"], W_TOGETHER)
         terms += _stay_close_terms(ctx["drive"], baseline_occ, W_STAY_CLOSE)
         terms += _stay_close_terms(ctx["ride"], baseline_occ, W_STAY_CLOSE)
+        terms += priority_fix_terms(ctx["runs"])
 
         drive_terms_by_person: Dict[str, list] = {}
         for (p, k, s), v in ctx["drive"].items():
@@ -325,6 +363,7 @@ def run_back_sim(
         terms += _stay_close_terms(ride_b, baseline_occ, W_STAY_CLOSE)
         terms += _stay_close_terms(hdrive_b, baseline_occ_no_section, W_STAY_CLOSE)
         terms += _stay_close_terms(hride_b, baseline_occ_no_section, W_STAY_CLOSE)
+        terms += priority_fix_terms(ctx["runs"])
 
         drive_terms_by_person: Dict[str, list] = {}
         for (p, k, s), v in drive_b.items():
@@ -487,9 +526,12 @@ def summarize_conditions(plan: List[SectionState], participants: Dict[str, Parti
         for p, (min_r, max_r) in driver_ranges.items()
     ]
 
+    priority_details, _ = check_priority_sections(plan, participants)
+
     return {
         "together": together_summary,
         "apart": apart_summary,
         "driver_ranges": driver_summary,
         "together_or": together_or_summary,
+        "priority_sections": priority_details,
     }
