@@ -18,7 +18,7 @@ from data_io.sheets_manager import (
 from logic.milp_allocator_v3 import generate_full_plan_cpsat, DEFAULT_TIME_LIMIT
 from logic.back_sim import BackSimConfig, run_back_sim, summarize_conditions
 from logic.car_pool import section_label, LARGE_CAR_IDS, NORMAL_CAR_IDS
-from data_io.output_writer import write_plan_xlsx
+from data_io.output_writer import write_plan_xlsx, SECTION_COLORS
 from data_io.plan_importer import (
     fetch_output_format_xlsx_from_google_sheet,
     import_participants_from_output_xlsx,
@@ -251,24 +251,6 @@ def _render_plan_result(plan, participants, xlsx_path, key_prefix, download_labe
 
 
 # 区間ごとの色分け(1〜10区)。ユーザー指定の配色見本から実際のピクセル色を抽出した値。
-SECTION_COLORS = {
-    1: "#DFBAB1",
-    2: "#EDCDCC",
-    3: "#F8E6D0",
-    4: "#FDF3D0",
-    5: "#DCE9D5",
-    6: "#D3DFE2",
-    7: "#CCDAF6",
-    8: "#D3E1F2",
-    9: "#D8D3E7",
-    10: "#E6D2DC",
-}
-
-
-def _section_highlight_color(section_id: int) -> str:
-    return SECTION_COLORS.get(section_id, "#EEEEEE")
-
-
 def _render_section_color_legend():
     """「次に走る区間」の色分け(SECTION_COLORS)が、どの区間がどの色かを示す凡例。"""
     chips = "".join(
@@ -285,108 +267,37 @@ def _render_section_color_legend():
 def _render_car_assignment_table(plan, participants, key_prefix):
     """Excelの「区間別配車」シートと同じ形式(1区間=1ブロック、車ID・車種・山行き・
     先行・運転手・同乗者…)の表を画面上にも出す。列構成・基本の表示テキストは
-    output_writer側の_car_blocks/_cars_headerをそのまま再利用してExcelとずれない
-    ようにしつつ、画面表示だけの追加情報として次の2つを重ねる(Excel書き出しには
-    一切影響しない):
-      1) 運転手・同乗者の各セルを、その人が次に走る区間に応じた色で塗る
-         (次に走る区間が無ければ何もしない)
-      2) 「先行」列を、その車の乗車メンバー構成が次に変わる区間の表示に差し替える
-         (直前区間のランナーを新規に乗せた行は「走者回収&◯区」の形にする)"""
-    from data_io.output_writer import _car_blocks, _cars_header
+    output_writer側の_car_blocks/_cars_headerをそのまま再利用し、「先行」列の上書き・
+    セルの背景色もoutput_writer.compute_car_table_overridesを共用することで、
+    Excel出力(区間別配車シート)と画面表示が完全に一致するようにしている。"""
+    from data_io.output_writer import _car_blocks, _cars_header, compute_car_table_overrides
 
     blocks = _car_blocks(plan, participants)
     header = _cars_header(blocks)
     n_cols = len(header)
-    driver_col = header.index("運転手")
     advance_col = header.index("先行")
-    passenger_cols = list(range(driver_col + 1, n_cols))
 
-    # blocksの表示テキストをそのまま使いつつ、同じ順序でplan側のメタ情報
-    # (区間ID・車ID・運転手/同乗者のparticipant_id)を並行して組み立てる
-    # (_car_blocksは1区間=1ブロックでsection.carsをそのままの順で並べているので、
-    # zipで1行ずつ対応が取れる)。
     rows = []
-    row_section_ids = []
-    row_car_ids = []
-    row_person_ids = []
-
-    for (label, section_rows), section in zip(blocks, plan):
+    for label, section_rows in blocks:
         if not section_rows:
             rows.append([label] + [""] * (n_cols - 1))
-            row_section_ids.append(section.section_id)
-            row_car_ids.append(None)
-            row_person_ids.append([None] * n_cols)
             continue
-        for i, (row, car) in enumerate(zip(section_rows, section.cars)):
+        for i, row in enumerate(section_rows):
             padded = list(row) + [""] * (n_cols - 1 - len(row))
             rows.append([label if i == 0 else ""] + padded)
-            row_section_ids.append(section.section_id)
-            row_car_ids.append(car.car_id)
 
-            pids = [None] * n_cols
-            pids[driver_col] = car.driver_id if car.driver_id in participants else None
-            for j, pid in enumerate(car.passenger_ids):
-                col = driver_col + 1 + j
-                if col < n_cols and pid in participants:
-                    pids[col] = pid
-            row_person_ids.append(pids)
-
-    # 各人が次に走る区間(ランナーとして登場する、今より後の最小section_id)
-    running_by_person: Dict[str, List[int]] = {}
-    runner_ids_by_section: Dict[int, set] = {}
-    for section in plan:
-        rids = {pid for pid in section.runner_ids if pid in participants}
-        runner_ids_by_section[section.section_id] = rids
-        for pid in rids:
-            running_by_person.setdefault(pid, []).append(section.section_id)
-    for lst in running_by_person.values():
-        lst.sort()
-
-    # 車IDごとに、乗車メンバー構成(運転手+同乗者の集合)が前回の登場区間から
-    # 変わった区間を集める
-    car_appearances: Dict[str, list] = {}
-    for sec_id, car_id, pids in zip(row_section_ids, row_car_ids, row_person_ids):
-        if car_id is None:
-            continue
-        roster = frozenset(p for p in pids if p is not None)
-        car_appearances.setdefault(car_id, []).append((sec_id, roster))
-
-    change_sections: Dict[str, List[int]] = {}
-    for car_id, appearances in car_appearances.items():
-        appearances.sort(key=lambda t: t[0])
-        change_sections[car_id] = [
-            cur_sec for (_, prev_roster), (cur_sec, cur_roster) in zip(appearances, appearances[1:])
-            if cur_roster != prev_roster
-        ]
-
-    # 「先行」列を上書きする(表示専用。Excel書き出しには影響しない)
-    for i, car_id in enumerate(row_car_ids):
-        if car_id is None:
-            continue
-        sec_id = row_section_ids[i]
-        current_people = [p for p in row_person_ids[i] if p is not None]
-        next_change = next((t for t in change_sections.get(car_id, []) if t > sec_id), None)
-        is_pickup = any(pid in runner_ids_by_section.get(sec_id - 1, set()) for pid in current_people)
-        if is_pickup:
-            rows[i][advance_col] = f"走者回収&{section_label(next_change)}" if next_change else "走者回収"
-        elif next_change is not None:
-            rows[i][advance_col] = section_label(next_change)
-        else:
-            rows[i][advance_col] = ""
+    advance_overrides, cell_fills = compute_car_table_overrides(plan, participants, header)
+    for i, override in enumerate(advance_overrides):
+        if override:
+            rows[i][advance_col] = override
 
     table = pd.DataFrame(rows, columns=header).fillna("")
 
     def _next_run_cell_styles(_data: pd.DataFrame) -> pd.DataFrame:
         styles = pd.DataFrame("", index=table.index, columns=table.columns)
-        for i, pids in enumerate(row_person_ids):
-            sec_id = row_section_ids[i]
-            for col in [driver_col] + passenger_cols:
-                pid = pids[col] if col < len(pids) else None
-                if pid is None:
-                    continue
-                future = [s for s in running_by_person.get(pid, []) if s > sec_id]
-                if future:
-                    styles.iat[i, col] = f"background-color: {_section_highlight_color(min(future))}"
+        for i, fills in enumerate(cell_fills):
+            for col, color in fills.items():
+                styles.iat[i, col] = f"background-color: {color}"
         return styles
 
     styled_table = table.style.apply(_next_run_cell_styles, axis=None)
