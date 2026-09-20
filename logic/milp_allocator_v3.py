@@ -32,7 +32,7 @@ from ortools.sat.python import cp_model
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import Participant, CarState, SectionState
 from validator import validate_section
-from logic.car_pool import ALL_CAR_IDS, CAR_TYPE, CAR_CAPACITY, CAR_COST, section_label
+from logic.car_pool import ALL_CAR_IDS, CAR_TYPE, CAR_CAPACITY, CAR_COST, LARGE_CAPACITY, section_label
 from data_io.output_writer import write_plan_xlsx
 
 W_FLEET = 5000
@@ -40,6 +40,11 @@ W_CONTINUITY = 5
 W_RUNNER_PREF = 50
 W_PRIORITY_RUNNER_PREF = 150  # 「特に走りたい区間」を実際に走れた場合の追加ボーナス(W_RUNNER_PREFに上乗せ)
 W_MTN_RUNNER_DRIVE = 500
+W_MTN_FLEET = 50000  # 山組の車の台数を減らす方向のソフト制約(W_PARKより強くし、より積極的に台数を絞る)。
+                      # Block A(7・8区、is_mtn_car)とBlock B(9・10区、mtn_car)の両方に効かせる
+                      # ―Block Bは「8区時点で山フラグが立っていた車をそのまま引き継ぐ」ハード制約が
+                      # あるため、Block A側で山フラグの立つ車の台数を絞らないとBlock Bだけ絞っても
+                      # 意味がない(実際に検証済み)。
 W_ADVANCE_SPREAD = 30
 W_PREV_RUN_DRIVE = 200
 W_PARK = 15000
@@ -84,7 +89,13 @@ def _solve(model: cp_model.CpModel, time_limit: float, workers: int) -> Tuple[cp
 # ---------------------------------------------------------------------------
 
 def _build_block_a(participants: Dict[str, Participant], car_ids: List[str],
-                    runner_limits: Optional[Dict[int, Tuple[int, Optional[int]]]] = None):
+                    runner_limits: Optional[Dict[int, Tuple[int, Optional[int]]]] = None,
+                    extra_objective_fn=None):
+    """extra_objective_fn: 裏シュミ(logic/back_sim.py)が個人の希望(一緒/離す)をソフト制約として
+    目的関数に追加するためのフック。model.Minimize()を呼ぶ直前に
+    extra_objective_fn(model, ctx)(ctxはこの関数が最後に返すのと同じ辞書)が呼ばれ、
+    追加の目的関数項のリストを返す想定(同じmodelインスタンス上でNewBoolVar等を
+    呼んでよい)。表シュミ単体では常にNone(挙動は不変)。"""
     runner_limits = runner_limits or {}
     large_ids = [k for k in car_ids if CAR_TYPE[k] == "large"]
     normal_ids = [k for k in car_ids if CAR_TYPE[k] == "normal"]
@@ -104,6 +115,25 @@ def _build_block_a(participants: Dict[str, Participant], car_ids: List[str],
         for s in sections:
             if participants[p].preferred_sections[s - 1] and _present(participants, p, s):
                 runs[(p, s)] = model.NewBoolVar(f"runs_{p}_{s}")
+
+    # 1区を走らず2区を走る人は、1区の時点では存在しない(現地集合)ものとして扱う。
+    # つまり1区で車に乗る必要がない(occが強制的に0になる)。
+    skip1_vars: Dict[str, object] = {}
+    for p in pids:
+        if not _present(participants, p, 1):
+            continue
+        run2 = runs.get((p, 2))
+        if run2 is None:
+            continue
+        run1 = runs.get((p, 1))
+        if run1 is None:
+            skip1_vars[p] = run2
+        else:
+            skip1 = model.NewBoolVar(f"skip1_{p}")
+            model.Add(skip1 <= run2)
+            model.Add(skip1 <= 1 - run1)
+            model.Add(skip1 >= run2 - run1)
+            skip1_vars[p] = skip1
 
     drive = {}
     for p in pids:
@@ -155,7 +185,10 @@ def _build_block_a(participants: Dict[str, Participant], car_ids: List[str],
                 terms.append(runs[(p, s)])
             terms += [drive[(p, k, s)] for k in car_ids if (p, k, s) in drive]
             terms += [ride[(p, k, s)] for k in car_ids if (p, k, s) in ride]
-            model.Add(sum(terms) == 1)
+            if s == 1 and p in skip1_vars:
+                model.Add(sum(terms) == 1 - skip1_vars[p])
+            else:
+                model.Add(sum(terms) == 1)
 
         runners_s = [runs[(p, s)] for p in pids if (p, s) in runs]
         min_n, max_n = runner_limits.get(s, (1, None))
@@ -343,8 +376,22 @@ def _build_block_a(participants: Dict[str, Participant], car_ids: List[str],
         if participants[p].priority_sections[s - 1]
     ]
 
+    ctx = dict(rent=rent, runs=runs, drive=drive, ride=ride, usedcar=usedcar,
+               is_mtn_car=is_mtn_car, occ=occ, pids=pids, sections=sections, car_ids=car_ids)
+
+    extra_terms = extra_objective_fn(model, ctx) if extra_objective_fn else []
+
+    # 山フラグが立つ車は少ないほど良いが、普通車(定員4)は大型車(定員8)の半分しか
+    # 運べないため、台数だけを見ると同じ1台でも「効率の悪さ」は倍になる。単純な
+    # 台数のカウントだと同じ人数でも大型1台+普通1台と大型2台が同列に扱われてしまう
+    # ため、定員に反比例させて普通車の方をより重く罰し、大型車への集約を促す。
+    mtn_car_penalty = sum(
+        is_mtn_car[(k, 8)] * (LARGE_CAPACITY // CAR_CAPACITY[k])
+        for k in car_ids
+    )
     model.Minimize(
         W_FLEET * sum(CAR_COST[k] * rent[k] for k in car_ids)
+        + W_MTN_FLEET * mtn_car_penalty
         - W_CONTINUITY * sum(match_vars)
         - W_RUNNER_PREF * sum(runs.values())
         - W_PRIORITY_RUNNER_PREF * sum(priority_run_vars)
@@ -355,10 +402,9 @@ def _build_block_a(participants: Dict[str, Participant], car_ids: List[str],
         + W_NO_GRADE2 * sum(no_grade2_vars)
         + W_NO_PASSENGER * sum(no_passenger_vars)
         + W_NO_RUN * sum(no_run_vars)
+        + sum(extra_terms)
     )
 
-    ctx = dict(rent=rent, runs=runs, drive=drive, ride=ride, usedcar=usedcar,
-               is_mtn_car=is_mtn_car, pids=pids, sections=sections, car_ids=car_ids)
     return model, ctx
 
 
@@ -413,7 +459,8 @@ def _build_block_b(participants: Dict[str, Participant], rent_solution: Dict[str
                     runs_used_in_a: Dict[str, int], ran_section_8: Optional[set] = None,
                     section8_mountain_drivers: Optional[Dict[str, str]] = None,
                     runner_limits: Optional[Dict[int, Tuple[int, Optional[int]]]] = None,
-                    ran_section_7_or_8: Optional[set] = None):
+                    ran_section_7_or_8: Optional[set] = None,
+                    extra_objective_fn=None):
     """section8_mountain_drivers: Block Aの8区で山フラグが立っていた車のcar_id -> 運転手id。
     山組は「1往復のみ」という前提(_build_block_bの元コメント参照)なので、8区で山行き車を
     運転していた人が9区でも同じ車を運転し続けるよう、Block B側にも引き継ぐ。"""
@@ -621,9 +668,23 @@ def _build_block_b(participants: Dict[str, Participant], rent_solution: Dict[str
         if participants[p].priority_sections[s - 1]
     ]
 
+    ctx = dict(mtn=mtn, mtn_car=mtn_car, runs=runs, drive=drive, ride=ride, usedcar=usedcar,
+               hdrive=hdrive, hride=hride, husedcar=husedcar,
+               pids=pids, sections=sections, rented_cars=rented_cars)
+
+    extra_terms = extra_objective_fn(model, ctx) if extra_objective_fn else []
+
+    # 普通車は大型車の半分の定員しか運べないため、山フラグ車の「台数」を単純に数えると
+    # 大型1台+普通1台と大型2台が同列になってしまう。定員に反比例させて普通車の方を
+    # より重く罰し、大型車への集約を促す(Block Aの同種の項と揃えている)。
+    mtn_car_penalty_b = sum(
+        mtn_car[k] * (LARGE_CAPACITY // CAR_CAPACITY[k])
+        for k in rented_cars
+    )
+
     # 0.1という小さい係数はCP-SATの整数目的関数と相性が悪いため10倍して整数化
     model.Minimize(
-        1 * sum(mtn_car.values())
+        10 * W_MTN_FLEET * mtn_car_penalty_b
         - 10 * W_RUNNER_PREF * sum(runs.values())
         - 10 * W_PRIORITY_RUNNER_PREF * sum(priority_run_vars_b)
         + 10 * W_PREV_RUN_DRIVE * sum(prev_run_drive_b_vars)
@@ -634,11 +695,9 @@ def _build_block_b(participants: Dict[str, Participant], rent_solution: Dict[str
         - 10 * W_PARK * sum(husedcar.values())
         + 10 * W_NO_PASSENGER * sum(h_no_passenger_vars)
         + 10 * W_NO_GRADE2 * sum(h_no_grade2_vars)
+        + 10 * sum(extra_terms)
     )
 
-    ctx = dict(mtn=mtn, mtn_car=mtn_car, runs=runs, drive=drive, ride=ride, usedcar=usedcar,
-               hdrive=hdrive, hride=hride, husedcar=husedcar,
-               pids=pids, sections=sections, rented_cars=rented_cars)
     return model, ctx
 
 
@@ -696,7 +755,8 @@ def _extract_hotel_group(solver: cp_model.CpSolver, ctx, participants) -> List[C
 # ---------------------------------------------------------------------------
 
 def _build_return_trip(participants: Dict[str, Participant], rent_solution: Dict[str, int],
-                        hotel_cars: Optional[List[CarState]] = None):
+                        hotel_cars: Optional[List[CarState]] = None,
+                        extra_objective_fn=None):
     pids = [p for p in participants if _needs_return_trip(participants, p)]
     rented_cars = [k for k in ALL_CAR_IDS if rent_solution.get(k, 0) == 1]
 
@@ -753,13 +813,16 @@ def _build_return_trip(participants: Dict[str, Participant], rent_solution: Dict
         model.Add(v_g2 >= usedcar[k] - sum(grade2_riders))
         r_no_grade2_vars.append(v_g2)
 
+    ctx = dict(drive=drive, ride=ride, usedcar=usedcar, pids=pids, rented_cars=rented_cars)
+
+    extra_terms = extra_objective_fn(model, ctx) if extra_objective_fn else []
+
     model.Minimize(
         -W_PARK * sum(usedcar.values())
         + W_NO_PASSENGER * sum(r_no_passenger_vars)
         + W_NO_GRADE2 * sum(r_no_grade2_vars)
+        + sum(extra_terms)
     )
-
-    ctx = dict(drive=drive, ride=ride, usedcar=usedcar, pids=pids, rented_cars=rented_cars)
     return model, ctx
 
 

@@ -66,6 +66,15 @@ def compute_individual_summary(
             for pid in car.passenger_ids:
                 if pid in summary:
                     summary[pid][label] = f"👥 同乗者({car.car_id})"
+
+    # 1区を走らず2区を走る人は、1区の時点で車に乗る必要がない(現地集合)ため、
+    # 1区の欄が空欄のままになる。他の空欄(単なる不参加)と区別できるよう明示的なラベルを付ける。
+    label_1 = section_label(1)
+    label_2 = section_label(2)
+    for pid, per_section in summary.items():
+        if label_1 not in per_section and per_section.get(label_2, "").startswith("🏃"):
+            per_section[label_1] = "現地集合"
+
     return summary
 
 

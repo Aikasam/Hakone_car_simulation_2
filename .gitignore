@@ -1,0 +1,30 @@
+# Pythonのキャッシュファイル
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 仮想環境
+venv/
+env/
+.venv/
+
+# Google APIなどの秘密の認証情報（絶対に共有しない！）
+credentials.json
+token.json
+.env
+.streamlit/secrets.toml
+
+# Mac特有のファイル
+.DS_Store
+
+# アプリの実行結果・ログ（実行するたびに再生成される）
+hakone_result*.xlsx
+*.log
+
+# 参加者の実名を含むデータ（絶対に共有しない！）
+participants.csv
+form_responses.csv
+back_sim_config.json
+
+# Claude Code のセッション作業ディレクトリ
+.claude/
