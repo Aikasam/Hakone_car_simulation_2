@@ -272,6 +272,21 @@ def run_back_sim(
     def priority_fix_terms(runs: Dict[Tuple[str, int], object]) -> list:
         return [-W_PRIORITY_FIX_PUSH * v for (p, s), v in runs.items() if (p, s) in unmet_priority_keys]
 
+    # 9・10区は「7・8区を走った人は9・10区を走行不可」というBlock A→Block Bをまたぐ
+    # ハード制約があるため(milp_allocator_v3._build_block_b参照)、Block B側だけで
+    # 9・10区の優先度を後押ししても、その人がBlock Aの時点で既に7・8区の担当に
+    # 決まっていれば手遅れになる。裏シュミではこれも直したいので、9・10区に未充足の
+    # 優先区間がある人については、Block A側でも7・8区の担当を避けるよう誘導する
+    # (もちろんソフトな誘導であり、他のハード制約は一切変えない)。
+    priority_910_people = {p for (p, s) in unmet_priority_keys if s in (9, 10)}
+
+    def priority_avoid_78_terms(runs_a: Dict[Tuple[str, int], object]) -> list:
+        return [
+            W_PRIORITY_FIX_PUSH * v
+            for (p, s), v in runs_a.items()
+            if p in priority_910_people and s in (7, 8)
+        ]
+
     def apply_driver_range_constraints(model, drive_terms_by_person: Dict[str, list], block_name: str):
         for p, terms_p in drive_terms_by_person.items():
             if p not in driver_ranges or not terms_p:
@@ -310,6 +325,7 @@ def run_back_sim(
         terms += _stay_close_terms(ctx["drive"], baseline_occ, W_STAY_CLOSE)
         terms += _stay_close_terms(ctx["ride"], baseline_occ, W_STAY_CLOSE)
         terms += priority_fix_terms(ctx["runs"])
+        terms += priority_avoid_78_terms(ctx["runs"])
 
         drive_terms_by_person: Dict[str, list] = {}
         for (p, k, s), v in ctx["drive"].items():
