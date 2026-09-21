@@ -5,6 +5,7 @@ from typing import Dict, List
 
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
 
 from data_io.public_sheets_reader import (
     load_participants_from_public_form_sheet,
@@ -18,7 +19,14 @@ from data_io.sheets_manager import (
 from logic.milp_allocator_v3 import generate_full_plan_cpsat, DEFAULT_TIME_LIMIT
 from logic.back_sim import BackSimConfig, run_back_sim, summarize_conditions, check_priority_sections
 from logic.car_pool import section_label, LARGE_CAR_IDS, NORMAL_CAR_IDS
-from data_io.output_writer import write_plan_xlsx, write_repaired_xlsx, SECTION_COLORS
+from data_io.output_writer import (
+    write_plan_xlsx,
+    write_repaired_xlsx,
+    write_updated_output_xlsx,
+    compute_individual_summary_static,
+    describe_car_row_changes,
+    SECTION_COLORS,
+)
 from data_io.plan_importer import (
     fetch_output_format_xlsx_from_google_sheet,
     import_participants_from_output_xlsx,
@@ -85,12 +93,17 @@ def _hidden_dot(spot_id: str, key: str) -> None:
 
 def _car_id_of_cell(text):
     """個人別まとめの1セルのテキスト(例: "🚘 運転手(L1)")から車両IDを取り出す。
-    車に乗っていない役割(ランナー・現地集合・不参加)ならNone。"""
+    車に乗っていない役割(ランナー・現地集合・不参加)ならNone。「運転手」「同乗者」の
+    直後の括弧だけを見るので、修理の変更箇所ハイライトで末尾に「（旧: ...）」が
+    追記されていても正しく車IDだけを取り出せる。⚠️重複(運転手と同乗者を兼ねる等の
+    異常データ)では複数マッチしうるが、元のテキスト生成順(compute_individual_summary
+    ではランナー→運転手→同乗者の順)の最後、すなわち一番優先度の低い役割の車IDを
+    採用する(旧: ...を追記する前の、文字列末尾を見ていた挙動に合わせるため)。"""
     import re
     if not isinstance(text, str):
         return None
-    m = re.search(r"\(([^)]+)\)\s*$", text)
-    return m.group(1) if m else None
+    matches = re.findall(r"(?:運転手|同乗者)\(([^)]+)\)", text)
+    return matches[-1] if matches else None
 
 
 def _condition_cell_styles(table: pd.DataFrame, together_map: dict, apart_map: dict, labels: list) -> pd.DataFrame:
@@ -127,6 +140,122 @@ def _condition_cell_styles(table: pd.DataFrame, together_map: dict, apart_map: d
     return styles
 
 
+def _render_individual_summary_table(
+    plan, participants, key_prefix, highlight=None, summary=None, old_summary=None,
+    unapplied_keys=None,
+):
+    """個人別まとめ(区間ごとの役割)の表を描画する。_render_plan_result(表シュミ・裏シュミの
+    結果表示)と修理の結果表示の両方から使う共通部品。summaryを渡さなければ
+    (表シュミ・裏シュミと同じ)validator.compute_individual_summaryで計算する。
+    修理の結果表示では、実際にExcelに書き込まれる内容(重複検知込み)と一致させるため、
+    output_writer.compute_individual_summary_staticの結果を渡す(修理で「適用しない」に
+    された分もすべて適用したフルの内容。実際に出力ファイルへ反映するかはunapplied_keys
+    で見た目だけ変える)。
+    old_summary(名前をキーにした修理前の表示値。_load_old_individual_summary_by_name
+    の結果)を渡すと、修理で変わったセルに(旧: ...)を追記する(フルスクリーン表示でも
+    見えるように、ツールチップではなくセルのテキスト自体に埋め込む)。
+    unapplied_keys((名前,区間)のset)に含まれるセルは、修理で変わってはいるが
+    「適用しない」と選ばれているため、(旧: ...)の表示はそのままに、赤字太字の
+    強調だけ外す(実際の出力ファイルではこのセルは修理前の値のまま書き出される)。"""
+    if summary is None:
+        summary = compute_individual_summary(plan, participants)
+    unapplied_keys = unapplied_keys or set()
+    labels = [section_label(s) for s in list(range(1, 11)) + [11]]
+    table = pd.DataFrame(
+        [
+            {"名前": p.name, **{label: summary.get(pid, {}).get(label, "") for label in labels}}
+            for pid, p in participants.items()
+        ]
+    )
+
+    changed_mask = pd.DataFrame(False, index=table.index, columns=table.columns)
+    if old_summary is not None:
+        for idx, name in table["名前"].items():
+            old_row = old_summary.get(name, {})
+            for label in labels:
+                old_val = old_row.get(label) or ""
+                new_val = table.at[idx, label] or ""
+                if old_val != new_val:
+                    changed_mask.at[idx, label] = True
+                    table.at[idx, label] = f"{new_val}　（旧: {old_val or '空欄'}）"
+
+    def _cell_color(text):
+        if isinstance(text, str) and text.startswith("⚠️重複"):
+            return "background-color: #FF9999"
+        if isinstance(text, str) and text.startswith("現地集合"):
+            return "background-color: #D9B3FF"
+        if isinstance(text, str) and text.startswith("🏃"):
+            return "background-color: #FFE699"
+        if isinstance(text, str) and text.startswith("🚘"):
+            return "background-color: #BDD7EE"
+        if isinstance(text, str) and text.startswith("👥"):
+            return "background-color: #C6E0B4"
+        return "background-color: #FFFFFF"
+
+    styled_table = table.style.map(_cell_color, subset=labels)
+    caption = "🟡 ランナー　🔵 運転手　🟢 同乗者　🟣 現地集合(1区は走らず2区から参加)　⚪ 不参加"
+
+    if changed_mask.to_numpy().any():
+        applied_mask = pd.DataFrame(True, index=table.index, columns=table.columns)
+        for idx, name in table["名前"].items():
+            for label in labels:
+                if (name, label) in unapplied_keys:
+                    applied_mask.at[idx, label] = False
+        border_styles = pd.DataFrame("", index=table.index, columns=table.columns)
+        for idx in table.index:
+            for label in labels:
+                if changed_mask.at[idx, label] and applied_mask.at[idx, label]:
+                    border_styles.at[idx, label] = "color: #CC3300; font-weight: bold"
+        styled_table = styled_table.apply(lambda _: border_styles, axis=None)
+        caption += (
+            "　｜　✏️ 赤文字＝修理で内容が変わり適用されるセル"
+            "　｜　（旧:...）だけ表示＝変わったが適用しないセル（内容は修理前の値のまま）"
+        )
+
+    if highlight:
+        together_names = highlight.get("together_names", set())
+        apart_names = highlight.get("apart_names", set())
+        driver_range_names = highlight.get("driver_range_names", set())
+
+        def _name_color(name):
+            in_together = name in together_names
+            in_apart = name in apart_names
+            if in_together and in_apart:
+                return "color: #A000A0; font-weight: bold"  # 両方指定されている人は紫で目立たせる
+            if in_apart:
+                return "color: #1E5FCC; font-weight: bold"
+            if in_together:
+                return "color: #CC3333; font-weight: bold"
+            return ""
+
+        def _bold_driver_row(row):
+            if row["名前"] not in driver_range_names:
+                return ["" for _ in row.index]
+            return [
+                "font-weight: bold" if (col in labels and isinstance(row[col], str) and row[col].startswith("🚘")) else ""
+                for col in row.index
+            ]
+
+        styled_table = styled_table.map(_name_color, subset=["名前"])
+        styled_table = styled_table.apply(_bold_driver_row, axis=1)
+
+        together_map = highlight.get("together_map", {})
+        apart_map = highlight.get("apart_map", {})
+        if together_map or apart_map:
+            styled_table = styled_table.apply(
+                _condition_cell_styles, axis=None,
+                together_map=together_map, apart_map=apart_map, labels=labels,
+            )
+
+        caption += (
+            "　｜　🔴 一緒にしたい人／一緒になれた区間　🔵 離したい人／離せた区間"
+            "　🟣 両方指定　太字の🚘=運転区間数を指定した人"
+        )
+
+    st.dataframe(styled_table, hide_index=True, use_container_width=True, key=f"{key_prefix}_table")
+    st.caption(caption)
+
+
 def _render_plan_result(plan, participants, xlsx_path, key_prefix, download_label, highlight=None):
     """表シュミ・裏シュミの結果表示で共通する部分(区間ごとの配車・個人別まとめ・
     メトリクス・Excelダウンロード)をまとめた描画関数。
@@ -159,71 +288,7 @@ def _render_plan_result(plan, participants, xlsx_path, key_prefix, download_labe
                 st.divider()
 
     with st.expander("👤 個人別まとめ（区間ごとの役割）"):
-        summary = compute_individual_summary(plan, participants)
-        labels = [section_label(s) for s in list(range(1, 11)) + [11]]
-        table = pd.DataFrame(
-            [
-                {"名前": p.name, **{label: summary.get(pid, {}).get(label, "") for label in labels}}
-                for pid, p in participants.items()
-            ]
-        )
-
-        def _cell_color(text):
-            if text == "現地集合":
-                return "background-color: #D9B3FF"
-            if isinstance(text, str) and text.startswith("🏃"):
-                return "background-color: #FFE699"
-            if isinstance(text, str) and text.startswith("🚘"):
-                return "background-color: #BDD7EE"
-            if isinstance(text, str) and text.startswith("👥"):
-                return "background-color: #C6E0B4"
-            return "background-color: #FFFFFF"
-
-        styled_table = table.style.map(_cell_color, subset=labels)
-        caption = "🟡 ランナー　🔵 運転手　🟢 同乗者　🟣 現地集合(1区は走らず2区から参加)　⚪ 不参加"
-
-        if highlight:
-            together_names = highlight.get("together_names", set())
-            apart_names = highlight.get("apart_names", set())
-            driver_range_names = highlight.get("driver_range_names", set())
-
-            def _name_color(name):
-                in_together = name in together_names
-                in_apart = name in apart_names
-                if in_together and in_apart:
-                    return "color: #A000A0; font-weight: bold"  # 両方指定されている人は紫で目立たせる
-                if in_apart:
-                    return "color: #1E5FCC; font-weight: bold"
-                if in_together:
-                    return "color: #CC3333; font-weight: bold"
-                return ""
-
-            def _bold_driver_row(row):
-                if row["名前"] not in driver_range_names:
-                    return ["" for _ in row.index]
-                return [
-                    "font-weight: bold" if (col in labels and isinstance(row[col], str) and row[col].startswith("🚘")) else ""
-                    for col in row.index
-                ]
-
-            styled_table = styled_table.map(_name_color, subset=["名前"])
-            styled_table = styled_table.apply(_bold_driver_row, axis=1)
-
-            together_map = highlight.get("together_map", {})
-            apart_map = highlight.get("apart_map", {})
-            if together_map or apart_map:
-                styled_table = styled_table.apply(
-                    _condition_cell_styles, axis=None,
-                    together_map=together_map, apart_map=apart_map, labels=labels,
-                )
-
-            caption += (
-                "　｜　🔴 一緒にしたい人／一緒になれた区間　🔵 離したい人／離せた区間"
-                "　🟣 両方指定　太字の🚘=運転区間数を指定した人"
-            )
-
-        st.dataframe(styled_table, hide_index=True, use_container_width=True, key=f"{key_prefix}_table")
-        st.caption(caption)
+        _render_individual_summary_table(plan, participants, key_prefix, highlight=highlight)
 
     with st.expander("🚘 区間別配車（Excelの「区間別配車」シートと同じ形式）"):
         _render_car_assignment_table(plan, participants, key_prefix=key_prefix)
@@ -265,34 +330,70 @@ def _render_section_color_legend():
     )
 
 
-def _render_car_assignment_table(plan, participants, key_prefix):
+def _render_car_assignment_table(plan, participants, key_prefix, old_table=None, revert_car_keys=None):
     """Excelの「区間別配車」シートと同じ形式(1区間=1ブロック、車ID・車種・山行き・
     先行・運転手・同乗者…)の表を画面上にも出す。列構成・基本の表示テキストは
     output_writer側の_car_blocks/_cars_headerをそのまま再利用し、「先行」列の上書き・
     セルの背景色もoutput_writer.compute_car_table_overridesを共用することで、
-    Excel出力(区間別配車シート)と画面表示が完全に一致するようにしている。"""
+    Excel出力(区間別配車シート)と画面表示が完全に一致するようにしている。
+    old_table((区間ラベル,車ID)をキーにした修理前の値。_load_old_cars_tableの結果)を
+    渡すと、修理で変わったセルに(旧: ...)を追記する。
+    revert_car_keys((区間ラベル,車ID)のset)に含まれる車は、UIで「適用しない」と
+    選ばれ実際の出力ファイルでは修理前の値のまま書き出されるが、この表示は
+    (旧: ...)の表示はそのままに赤字太字の強調だけ外す(出力ファイルの内容と
+    見分けられるように、内容自体は変えない)。"""
     from data_io.output_writer import _car_blocks, _cars_header, compute_car_table_overrides
 
     blocks = _car_blocks(plan, participants)
     header = _cars_header(blocks)
     n_cols = len(header)
     advance_col = header.index("先行")
+    revert_car_keys = revert_car_keys or set()
 
     rows = []
+    row_keys = []  # (区間ラベル, 車ID) を各行に対応させたリスト(車が無い区間はcar_id=None)
     for label, section_rows in blocks:
         if not section_rows:
             rows.append([label] + [""] * (n_cols - 1))
+            row_keys.append((label, None))
             continue
         for i, row in enumerate(section_rows):
             padded = list(row) + [""] * (n_cols - 1 - len(row))
             rows.append([label if i == 0 else ""] + padded)
+            row_keys.append((label, row[0]))
 
-    advance_overrides, cell_fills = compute_car_table_overrides(plan, participants, header)
+    advance_overrides, cell_fills, pickup_cols = compute_car_table_overrides(plan, participants, header)
     for i, override in enumerate(advance_overrides):
         if override:
             rows[i][advance_col] = override
 
     table = pd.DataFrame(rows, columns=header).fillna("")
+
+    changed_mask = pd.DataFrame(False, index=table.index, columns=table.columns)
+    if old_table is not None:
+        for i, (label, car_id) in enumerate(row_keys):
+            if car_id is None:
+                continue
+            old_row = old_table.get((label, car_id))
+            if old_row is None:
+                continue
+            for col_name in header:
+                if col_name in ("区間", "車ID"):
+                    continue
+                old_val = old_row.get(col_name) or ""
+                new_val = table.at[i, col_name] or ""
+                if str(old_val) != str(new_val):
+                    changed_mask.at[i, col_name] = True
+                    table.at[i, col_name] = f"{new_val}　（旧: {old_val or '空欄'}）"
+
+    # 直前の区間でランナーだった(=走者回収された)人のセルに🔴マークを付ける
+    # (Excel出力側は赤枠で囲むが、st.dataframeはCSSのborderを描画しないため
+    # 見た目上の代替としてマークを使う)。diffの比較には影響しないよう、
+    # 修理前後の比較(上のchanged_mask算出)より後に追加する。
+    for i, pickups in enumerate(pickup_cols):
+        for col in pickups:
+            col_name = header[col]
+            table.at[i, col_name] = f"🔴 {table.at[i, col_name]}"
 
     def _next_run_cell_styles(_data: pd.DataFrame) -> pd.DataFrame:
         styles = pd.DataFrame("", index=table.index, columns=table.columns)
@@ -302,11 +403,27 @@ def _render_car_assignment_table(plan, participants, key_prefix):
         return styles
 
     styled_table = table.style.apply(_next_run_cell_styles, axis=None)
-    st.dataframe(styled_table, hide_index=True, use_container_width=True, key=f"{key_prefix}_car_table")
-    st.caption(
+    caption = (
         "「先行」列 = その車の乗車メンバーが次に変わる区間"
         "（直前区間のランナーを新たに乗せた行は「走者回収&◯区」）"
+        "　｜　🔴 ＝直前の区間でランナーだった人(走者回収された人、Excel上は赤枠)"
     )
+    if changed_mask.to_numpy().any():
+        border_styles = pd.DataFrame("", index=table.index, columns=table.columns)
+        for i, (label, car_id) in enumerate(row_keys):
+            if car_id is None or (label, car_id) in revert_car_keys:
+                continue
+            for col_name in header:
+                if changed_mask.at[i, col_name]:
+                    border_styles.at[i, col_name] = "color: #CC3300; font-weight: bold"
+        styled_table = styled_table.apply(lambda _: border_styles, axis=None)
+        caption += (
+            "　｜　✏️ 赤文字＝修理で内容が変わり適用されるセル"
+            "　｜　（旧:...）だけ表示＝変わったが適用しないセル（内容は修理前の値のまま）"
+        )
+
+    st.dataframe(styled_table, hide_index=True, use_container_width=True, key=f"{key_prefix}_car_table")
+    st.caption(caption)
     _render_section_color_legend()
 
 
@@ -314,7 +431,10 @@ def _select_source_plan(key_prefix: str):
     """表シュミの出力形式(入力データ／区間別ランナー／区間別配車の3シート)のファイルや
     スプレッドシートを選んでplan/participantsを復元する、入力元選択UI。裏シュミ・修理の
     どちらからも同じ部品を使う(key_prefixでウィジェットキーの衝突を避ける)。
-    選べていなければ(None, None)を返す。"""
+    選べていなければ(None, None, None)を返す。raw_bytesは元ファイルの生のバイト列
+    (「直前の表シュミ結果を使う」の場合も、表シュミが同時に保存したOUTPUT_XLSX_PATHを
+    読んで返す。それも無ければNone)。修理機能が、修理前の個人別まとめの内容との比較や、
+    修理対象外の内容を保持したまま書き出し直すための土台として使う。"""
     has_forward_result = bool(st.session_state.get("result"))
     has_saved_output = os.path.exists(OUTPUT_XLSX_PATH)
 
@@ -330,15 +450,24 @@ def _select_source_plan(key_prefix: str):
 
     plan = None
     participants = None
+    raw_bytes = None
 
     if source == "直前の表シュミ結果を使う":
         plan = st.session_state["result"]["plan"]
         participants = st.session_state["result"]["participants"]
+        if os.path.exists(OUTPUT_XLSX_PATH):
+            try:
+                with open(OUTPUT_XLSX_PATH, "rb") as f:
+                    raw_bytes = f.read()
+            except Exception:
+                raw_bytes = None
     elif source == "保存済みの表シュミ結果ファイルを使う":
         st.caption(f"前回保存された結果ファイル（{OUTPUT_XLSX_PATH}）を読み込みます。")
         try:
-            participants = import_participants_from_output_xlsx(OUTPUT_XLSX_PATH)
-            plan = import_plan_from_output_xlsx(OUTPUT_XLSX_PATH, participants)
+            with open(OUTPUT_XLSX_PATH, "rb") as f:
+                raw_bytes = f.read()
+            participants = import_participants_from_output_xlsx(io.BytesIO(raw_bytes))
+            plan = import_plan_from_output_xlsx(io.BytesIO(raw_bytes), participants)
             st.success(f"参加者 {len(participants)} 名のデータを読み込みました。")
         except Exception as e:
             st.error(f"ファイルの読み込みに失敗しました。\n\n{e}")
@@ -350,9 +479,9 @@ def _select_source_plan(key_prefix: str):
         )
         if sheet_url:
             try:
-                data = fetch_output_format_xlsx_from_google_sheet(sheet_url).getvalue()
-                participants = import_participants_from_output_xlsx(io.BytesIO(data))
-                plan = import_plan_from_output_xlsx(io.BytesIO(data), participants)
+                raw_bytes = fetch_output_format_xlsx_from_google_sheet(sheet_url).getvalue()
+                participants = import_participants_from_output_xlsx(io.BytesIO(raw_bytes))
+                plan = import_plan_from_output_xlsx(io.BytesIO(raw_bytes), participants)
                 st.success(f"参加者 {len(participants)} 名のデータを読み込みました。")
             except Exception as e:
                 st.error(f"スプレッドシートの読み込みに失敗しました。表シュミの出力形式か、共有設定を確認してください。\n\n{e}")
@@ -363,14 +492,185 @@ def _select_source_plan(key_prefix: str):
         )
         if uploaded is not None:
             try:
-                data = uploaded.getvalue()
-                participants = import_participants_from_output_xlsx(io.BytesIO(data))
-                plan = import_plan_from_output_xlsx(io.BytesIO(data), participants)
+                raw_bytes = uploaded.getvalue()
+                participants = import_participants_from_output_xlsx(io.BytesIO(raw_bytes))
+                plan = import_plan_from_output_xlsx(io.BytesIO(raw_bytes), participants)
                 st.success(f"参加者 {len(participants)} 名のデータを読み込みました。")
             except Exception as e:
                 st.error(f"ファイルの読み込みに失敗しました。表シュミの出力形式のxlsxか確認してください。\n\n{e}")
 
-    return plan, participants
+    return plan, participants, raw_bytes
+
+
+def _load_old_individual_summary_by_name(raw_bytes):
+    """修理前の「個人別まとめ」シートに残っていたキャッシュ済みの表示値(元ファイルが
+    実際にGoogle Sheets/Excelで開かれた際に保存されたもの)を、名前をキーに読み込む。
+    元ファイルにキャッシュが無い(作成後に一度も開かれていない等)場合はNoneを返し、
+    比較できないことを示す。"""
+    if not raw_bytes:
+        return None
+    try:
+        wb = load_workbook(io.BytesIO(raw_bytes), data_only=True)
+    except Exception:
+        return None
+    if "個人別まとめ" not in wb.sheetnames:
+        return None
+    ws = wb["個人別まとめ"]
+    header = [c.value for c in ws[1]]
+    if "名前" not in header:
+        return None
+    name_col = header.index("名前") + 1
+    # 区間ラベル以外の列(「凡例」の見出しなど、同じ行範囲に横並びで書かれている
+    # 凡例欄)を取り違えて「キャッシュあり」と誤判定しないよう、比較対象は
+    # _diff_individual_summaryが実際に見る区間ラベルだけに絞る。
+    section_labels = set(section_label(s) for s in list(range(1, 11)) + [11])
+
+    old_by_name: Dict[str, Dict[str, str]] = {}
+    any_value_found = False
+    for r in range(2, ws.max_row + 1):
+        name = ws.cell(row=r, column=name_col).value
+        if not name:
+            continue
+        row_vals = {}
+        for c, label in enumerate(header, start=1):
+            if label not in section_labels:
+                continue
+            v = ws.cell(row=r, column=c).value
+            if v:
+                any_value_found = True
+            row_vals[label] = v
+        old_by_name[name] = row_vals
+
+    if not any_value_found:
+        return None
+    return old_by_name
+
+
+def _diff_individual_summary(old_by_name, participants, new_summary):
+    """修理前の「個人別まとめ」の表示値(_load_old_individual_summary_by_nameの結果)と、
+    修理後の内容をセル単位で突き合わせ、変わった箇所だけを返す。old_by_nameがNone
+    (比較できない)ならNoneを返す。"""
+    if old_by_name is None:
+        return None
+    labels = [section_label(s) for s in list(range(1, 11)) + [11]]
+    diffs = []
+    for pid, p in participants.items():
+        old_row = old_by_name.get(p.name, {})
+        new_row = new_summary.get(pid, {})
+        for label in labels:
+            old_val = old_row.get(label) or ""
+            new_val = new_row.get(label) or ""
+            if old_val != new_val:
+                diffs.append({
+                    "適用する": True, "名前": p.name, "区間": label,
+                    "修理前": old_val or "(空欄)", "修理後": new_val or "(空欄)",
+                })
+    return diffs
+
+
+def _load_old_cars_table(raw_bytes):
+    """修理前の「区間別配車」シートの表示値を、(区間ラベル, 車ID)をキーに読み込む。
+    このシートは元々数式を使わない(_write_cars_sheet参照)ため、個人別まとめと違い
+    「一度もExcelで開かれていないとキャッシュが無い」という制約が無く、常に実際の
+    値を読める。raw_bytesが無い/シート構成が想定と違う場合はNoneを返す。"""
+    if not raw_bytes:
+        return None
+    try:
+        wb = load_workbook(io.BytesIO(raw_bytes), data_only=True)
+    except Exception:
+        return None
+    if "区間別配車" not in wb.sheetnames:
+        return None
+    ws = wb["区間別配車"]
+    header = [c.value for c in ws[1]]
+    if "車ID" not in header or "区間" not in header:
+        return None
+    car_id_col = header.index("車ID") + 1
+
+    title_row = None
+    for r in range(2, ws.max_row + 1):
+        v = ws.cell(row=r, column=1).value
+        if isinstance(v, str) and v.startswith("■"):
+            title_row = r
+            break
+    last_row = (title_row - 1) if title_row else ws.max_row
+
+    old_by_key: Dict[tuple, Dict[str, object]] = {}
+    current_label = None
+    for r in range(2, last_row + 1):
+        label_cell = ws.cell(row=r, column=1).value
+        if label_cell:
+            current_label = label_cell
+        car_id = ws.cell(row=r, column=car_id_col).value
+        if current_label is None or not car_id:
+            continue
+        row_vals = {}
+        for c, col_name in enumerate(header, start=1):
+            if not col_name or col_name in ("区間", "車ID"):
+                continue
+            row_vals[col_name] = ws.cell(row=r, column=c).value
+        old_by_key[(current_label, str(car_id))] = row_vals
+    return old_by_key
+
+
+def _cars_diff_rows(raw_bytes, plan, participants):
+    """区間別配車で修理/裏シュミにより実際に変わる行だけを、UIで選択できる一覧として
+    返す(「適用する」列付き)。raw_bytesが無い、ファイルが読めない、またはシートの
+    見出しが想定と違って比較できない場合はNoneを返す(区別のため、差分が無い場合は
+    空リストを返す)。"""
+    if not raw_bytes:
+        return None
+    try:
+        wb = load_workbook(io.BytesIO(raw_bytes))
+    except Exception:
+        return None
+    if "区間別配車" not in wb.sheetnames:
+        return None
+    changes = describe_car_row_changes(wb["区間別配車"], plan, participants)
+    if changes is None:
+        return None
+    rows = []
+    for c in changes:
+        if not c["changed"]:
+            continue
+        parts = []
+        if (c["old_advance"] or None) != (c["new_advance"] or None):
+            parts.append(f"先行: {c['old_advance'] or '(空欄)'} → {c['new_advance'] or '(空欄)'}")
+        if set(c["old_names"]) != set(c["new_names"]):
+            old_text = "、".join(c["old_names"]) or "(空欄)"
+            new_text = "、".join(c["new_names"]) or "(空欄)"
+            parts.append(f"乗車者: {old_text} → {new_text}")
+        rows.append({
+            "適用する": True, "区間": c["label"], "車ID": c["car_id"],
+            "変更内容": " ／ ".join(parts),
+        })
+    return rows
+
+
+def _apply_individual_diff_selection(new_summary, old_individual, participants, apply_individual):
+    """個人別まとめの差分ごとの適用フラグ(apply_individual、(名前,区間)→bool)を見て、
+    適用しないと選ばれたセルだけ修理前の値に戻したsummaryを返す(new_summary自体は
+    書き換えない)。"""
+    summary = {pid: dict(v) for pid, v in new_summary.items()}
+    if old_individual is None:
+        return summary
+    name_to_pid = {p.name: pid for pid, p in participants.items()}
+    for (name, label), apply in apply_individual.items():
+        if apply:
+            continue
+        pid = name_to_pid.get(name)
+        if pid is None:
+            continue
+        old_val = old_individual.get(name, {}).get(label) or ""
+        summary[pid][label] = old_val
+    return summary
+
+
+def _revert_car_keys_from_selection(apply_cars):
+    """区間別配車の差分ごとの適用フラグ(apply_cars、(区間,車ID)→bool)から、適用しないと
+    選ばれた(区間,車ID)のsetを返す。"""
+    return {key for key, apply in apply_cars.items() if not apply}
+
 
 
 def _render_repair_section():
@@ -386,27 +686,152 @@ def _render_repair_section():
         "書き出し直すだけです。"
     )
 
-    plan, participants = _select_source_plan("repair")
+    plan, participants, raw_bytes = _select_source_plan("repair")
     if plan is None or participants is None:
         st.info("修理するには、上で入力元を指定してください。")
         return
 
     if st.button("🔧 修理を実行", type="primary", key="repair_run"):
-        write_repaired_xlsx(plan, participants, REPAIR_OUTPUT_XLSX_PATH)
-        st.session_state.repair_result = {"plan": plan, "participants": participants}
+        if not raw_bytes:
+            st.error("修理の土台となる元ファイルが見つかりませんでした。もう一度入力元を選び直してください。")
+            return
+        new_summary_full = compute_individual_summary_static(plan, participants)
+        old_individual = _load_old_individual_summary_by_name(raw_bytes)
+        old_cars = _load_old_cars_table(raw_bytes)
+        individual_diffs = _diff_individual_summary(old_individual, participants, new_summary_full)
+        cars_diffs = _cars_diff_rows(raw_bytes, plan, participants)
+        st.session_state.repair_result = {
+            "plan": plan, "participants": participants, "raw_bytes": raw_bytes,
+            "new_summary_full": new_summary_full, "old_individual": old_individual, "old_cars": old_cars,
+            "individual_diffs": individual_diffs, "cars_diffs": cars_diffs,
+        }
+        # 「適用する/しない」の状態は、この2つの辞書を単一の根拠(source of truth)として
+        # 持つ。チェックボックス表・一括ボタン・プレビュー表での選択操作は、いずれも
+        # この辞書を更新してからrepair_revisionを進め、ウィジェットのキーを変えて
+        # 強制的に再構築させることで反映する(st.data_editor自身の編集履歴と
+        # 食い違わないようにするため)。
+        st.session_state.repair_apply_individual = {
+            (row["名前"], row["区間"]): True for row in (individual_diffs or [])
+        }
+        st.session_state.repair_apply_cars = {
+            (row["区間"], row["車ID"]): True for row in (cars_diffs or [])
+        }
+        st.session_state.repair_revision = 0
 
     repair_result = st.session_state.get("repair_result")
-    if repair_result:
-        st.success("修理済みのファイルを作成しました。")
-        with st.expander("🚘 区間別配車（Excelの「区間別配車」シートと同じ形式）"):
-            _render_car_assignment_table(repair_result["plan"], repair_result["participants"], key_prefix="repair")
-        if os.path.exists(REPAIR_OUTPUT_XLSX_PATH):
-            with open(REPAIR_OUTPUT_XLSX_PATH, "rb") as f:
-                st.download_button(
-                    "📊 修理済みExcelをダウンロード", f,
-                    file_name=os.path.basename(REPAIR_OUTPUT_XLSX_PATH),
-                    mime=XLSX_MIME, type="primary", key="repair_download",
-                )
+    if not repair_result:
+        return
+
+    r_plan = repair_result["plan"]
+    r_participants = repair_result["participants"]
+    r_raw_bytes = repair_result["raw_bytes"]
+    individual_diffs = repair_result.get("individual_diffs")
+    cars_diffs = repair_result.get("cars_diffs")
+    apply_individual = st.session_state.setdefault("repair_apply_individual", {})
+    apply_cars = st.session_state.setdefault("repair_apply_cars", {})
+    revision = st.session_state.get("repair_revision", 0)
+
+    def _bump_revision():
+        st.session_state.repair_revision = st.session_state.get("repair_revision", 0) + 1
+        st.rerun()
+
+    st.markdown("#### 修理で変わる内容の確認")
+    st.caption(
+        "チェックを外した行、または下の個人別まとめ・区間別配車の表で選んで「適用しない」に"
+        "した箇所は、実際の出力ファイルでは修理前の内容のまま保たれます。"
+    )
+
+    if individual_diffs is None:
+        st.caption("ℹ️ 元ファイルの個人別まとめに保存済みの表示内容が見つからず、修理前との比較はできませんでした。")
+    elif len(individual_diffs) == 0:
+        st.caption("個人別まとめの内容に、修理前との差分はありませんでした。")
+    else:
+        st.markdown(f"**個人別まとめで変更された箇所（{len(individual_diffs)}件）**")
+        bcol1, bcol2 = st.columns(2)
+        if bcol1.button("すべて適用する", key="repair_individual_select_all"):
+            for k in apply_individual:
+                apply_individual[k] = True
+            _bump_revision()
+        if bcol2.button("すべて適用しない", key="repair_individual_select_none"):
+            for k in apply_individual:
+                apply_individual[k] = False
+            _bump_revision()
+
+        individual_df = pd.DataFrame([
+            {**row, "適用する": apply_individual.get((row["名前"], row["区間"]), True)}
+            for row in individual_diffs
+        ])
+        edited_individual_df = st.data_editor(
+            individual_df, hide_index=True, use_container_width=True,
+            key=f"repair_individual_diff_editor_{revision}",
+            disabled=["名前", "区間", "修理前", "修理後"],
+            column_config={"適用する": st.column_config.CheckboxColumn(default=True)},
+        )
+        for _, r in edited_individual_df.iterrows():
+            apply_individual[(r["名前"], r["区間"])] = bool(r["適用する"])
+
+    final_summary = _apply_individual_diff_selection(
+        repair_result["new_summary_full"], repair_result["old_individual"], r_participants, apply_individual)
+
+    if individual_diffs:
+        unapplied_individual_keys = {k for k, v in apply_individual.items() if not v}
+        st.markdown("**👤 個人別まとめ（区間ごとの役割）**")
+        _render_individual_summary_table(
+            r_plan, r_participants, key_prefix="repair", summary=repair_result["new_summary_full"],
+            old_summary=repair_result.get("old_individual"), unapplied_keys=unapplied_individual_keys,
+        )
+
+    if cars_diffs is None:
+        st.caption("ℹ️ 元ファイルの区間別配車シートの形式が確認できず、修理前との比較はできませんでした。")
+    elif len(cars_diffs) == 0:
+        st.caption("区間別配車の内容に、修理前との差分はありませんでした。")
+    else:
+        st.markdown(f"**区間別配車で変更された箇所（{len(cars_diffs)}件）**")
+        bcol1, bcol2 = st.columns(2)
+        if bcol1.button("すべて適用する", key="repair_cars_select_all"):
+            for k in apply_cars:
+                apply_cars[k] = True
+            _bump_revision()
+        if bcol2.button("すべて適用しない", key="repair_cars_select_none"):
+            for k in apply_cars:
+                apply_cars[k] = False
+            _bump_revision()
+
+        cars_df = pd.DataFrame([
+            {**row, "適用する": apply_cars.get((row["区間"], row["車ID"]), True)}
+            for row in cars_diffs
+        ])
+        edited_cars_df = st.data_editor(
+            cars_df, hide_index=True, use_container_width=True,
+            key=f"repair_cars_diff_editor_{revision}",
+            disabled=["区間", "車ID", "変更内容"],
+            column_config={"適用する": st.column_config.CheckboxColumn(default=True)},
+        )
+        for _, r in edited_cars_df.iterrows():
+            apply_cars[(r["区間"], r["車ID"])] = bool(r["適用する"])
+
+    revert_car_keys = _revert_car_keys_from_selection(apply_cars)
+
+    if cars_diffs:
+        st.markdown("**🚘 区間別配車（Excelの「区間別配車」シートと同じ形式）**")
+        _render_car_assignment_table(
+            r_plan, r_participants, key_prefix="repair",
+            old_table=repair_result.get("old_cars"), revert_car_keys=revert_car_keys,
+        )
+
+    write_repaired_xlsx(
+        io.BytesIO(r_raw_bytes), r_plan, r_participants, REPAIR_OUTPUT_XLSX_PATH,
+        revert_car_keys=revert_car_keys, individual_summary=final_summary,
+    )
+    st.success("修理済みのファイルを作成しました（選択内容を反映済み）。")
+
+    if os.path.exists(REPAIR_OUTPUT_XLSX_PATH):
+        with open(REPAIR_OUTPUT_XLSX_PATH, "rb") as f:
+            st.download_button(
+                "📊 修理済みExcelをダウンロード", f,
+                file_name=os.path.basename(REPAIR_OUTPUT_XLSX_PATH),
+                mime=XLSX_MIME, type="primary", key="repair_download",
+            )
 
 
 def _render_back_sim_section():
@@ -419,7 +844,7 @@ def _render_back_sim_section():
         "免許・定員などの必須条件や、表シュミ側の希望(特に「特に走りたい区間」)はここでの新しい条件より優先されます。"
     )
 
-    plan, participants = _select_source_plan("back")
+    plan, participants, raw_bytes = _select_source_plan("back")
     if plan is None or participants is None:
         st.info("裏シュミを実行するには、上で入力元を指定してください。")
         return
@@ -555,6 +980,14 @@ def _render_back_sim_section():
             key="back_time_limit",
         )
 
+        back_output_format = st.radio(
+            "出力するExcelの形式", ["関数組み込みVer（バグが起こる場合があります）", "関数なしVer"],
+            horizontal=True, key="back_output_format",
+            help="関数なしVerでは、区間別配車・区間別ランナーのうち裏シュミで実際に変わった箇所だけを"
+                 "書き換え、それ以外(メモ・運転手一覧など)は入力元ファイルのまま保持します。",
+        )
+        back_use_formulas = back_output_format.startswith("関数組み込み")
+
         has_any_condition = bool(together_pairs or together_or_groups or apart_pairs or driver_ranges)
         needs_optimization = has_any_condition or bool(unmet_priority)
         if has_any_condition:
@@ -565,6 +998,16 @@ def _render_back_sim_section():
             run_help = "条件が指定されていないため、再計算せずそのまま結果を表示します（区間別配車の表の確認などに）。"
         run_back = st.button("裏シュミを実行", type="primary", help=run_help)
 
+    def _write_back_output(back_plan):
+        if back_use_formulas:
+            write_plan_xlsx(back_plan, participants, BACK_OUTPUT_XLSX_PATH, use_formulas=True)
+        elif raw_bytes:
+            write_updated_output_xlsx(io.BytesIO(raw_bytes), back_plan, participants, BACK_OUTPUT_XLSX_PATH)
+        else:
+            # 元ファイルが無い(入力元が「直前の表シュミ結果を使う」で保存前など)場合は、
+            # 修理対象外の内容を保持できないが、新形式そのものは出力できるようにする。
+            write_plan_xlsx(back_plan, participants, BACK_OUTPUT_XLSX_PATH, use_formulas=False)
+
     if run_back:
         back_log_buf = io.StringIO()
         config = BackSimConfig(
@@ -574,14 +1017,14 @@ def _render_back_sim_section():
         if not needs_optimization:
             back_log_buf.write("条件が指定されておらず、「特に走りたい区間」も充足済みのため、計算をせずに読み込んだ結果をそのまま表示します。\n")
             back_plan = plan
-            write_plan_xlsx(back_plan, participants, BACK_OUTPUT_XLSX_PATH)
+            _write_back_output(back_plan)
             condition_summary = summarize_conditions(back_plan, participants, config)
         else:
             with st.spinner("裏シュミを計算中..."):
                 try:
                     with contextlib.redirect_stdout(back_log_buf):
                         back_plan = run_back_sim(plan, participants, config, time_limit=back_time_limit)
-                        write_plan_xlsx(back_plan, participants, BACK_OUTPUT_XLSX_PATH)
+                        _write_back_output(back_plan)
                         condition_summary = summarize_conditions(back_plan, participants, config)
                 except Exception as e:
                     st.error(f"裏シュミの計算に失敗しました。\n\n{e}")
@@ -799,6 +1242,14 @@ time_limit = st.number_input(
     help="大型車が少ない構成では最適解を見つけるのに数分かかることがあります。",
 )
 
+output_format = st.radio(
+    "出力するExcelの形式", ["関数組み込みVer（バグが起こる場合があります）", "関数なしVer"],
+    horizontal=True, key="fwd_output_format",
+    help="関数組み込みVerは区間別配車・区間別ランナーを手動編集すると個人別まとめが自動追従しますが、"
+         "セルのドラッグ移動などで数式が壊れることがあります。関数なしVerは自動追従しない代わりに壊れません。",
+)
+use_formulas = output_format.startswith("関数組み込み")
+
 can_write_back = use_auth and os.path.exists(CREDENTIALS_PATH)
 write_back = st.checkbox(
     "結果をスプレッドシートに書き戻す（「入力データ」「配車結果」シートを作成/上書き）",
@@ -843,6 +1294,7 @@ if st.button("シミュレーション実行", type="primary", disabled=not url 
                     time_limit=time_limit,
                     output_path=OUTPUT_XLSX_PATH,
                     runner_limits=runner_limits,
+                    use_formulas=use_formulas,
                 )
         except Exception as e:
             st.error(f"計算に失敗しました。\n\n{e}")

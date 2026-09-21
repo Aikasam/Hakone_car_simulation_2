@@ -864,6 +864,7 @@ def generate_full_plan_cpsat(
     workers: int = DEFAULT_WORKERS,
     output_path: Optional[str] = "hakone_result.xlsx",
     runner_limits: Optional[Dict[int, Tuple[int, Optional[int]]]] = None,
+    use_formulas: bool = True,
 ) -> List[SectionState]:
     """runner_limits: 区間番号(1〜10) -> (最少人数, 最大人数)。最大人数はNoneで無制限。
     指定のない区間は既定値(最少1人・無制限)になる。"""
@@ -969,5 +970,5 @@ def generate_full_plan_cpsat(
     print(f"\n🚗 レンタルした車: 大型{large_n}台 + 普通{normal_n}台 = 合計{len(used)}台")
 
     if output_path:
-        write_plan_xlsx(plan, participants, output_path)
+        write_plan_xlsx(plan, participants, output_path, use_formulas=use_formulas)
     return plan

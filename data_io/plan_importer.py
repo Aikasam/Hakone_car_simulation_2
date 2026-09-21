@@ -186,6 +186,7 @@ def import_plan_from_output_xlsx(path: str, participants: Dict[str, Participant]
     cars_header = [ws_cars.cell(row=1, column=c).value for c in range(1, ws_cars.max_column + 1)]
     driver_col = cars_header.index("運転手") + 1
     passenger_cols = [i + 1 for i, v in enumerate(cars_header) if v and str(v).startswith("同乗者")]
+    mountain_col = cars_header.index("山行き") + 1 if "山行き" in cars_header else None
 
     title_row = None
     for r in range(2, ws_cars.max_row + 1):
@@ -211,11 +212,16 @@ def import_plan_from_output_xlsx(path: str, participants: Dict[str, Participant]
             pid for c in passenger_cols
             if (pid := resolve(ws_cars.cell(row=r, column=c).value)) is not None
         ]
+        # 「山行き」列は★山行き/🏨ホテル組/空欄のいずれかを表示するだけの列だが、
+        # 元の表示をそのまま(変更せず)書き出し直せるように、その2値をここで読み戻す。
+        mountain_text = str(ws_cars.cell(row=r, column=mountain_col).value or "").strip() if mountain_col else ""
         car_state = CarState(
             car_id=str(car_id),
             driver_id=driver_pid or "NO_DRIVER",
             passenger_ids=passenger_ids,
             car_type=CAR_TYPE.get(str(car_id), "normal"),
+            is_mountain_goer=(mountain_text == "★山行き"),
+            group=("hotel" if mountain_text == "🏨ホテル組" else None),
         )
         cars_by_label.setdefault(current_label, []).append(car_state)
 
