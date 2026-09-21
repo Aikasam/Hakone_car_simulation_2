@@ -18,7 +18,7 @@ from data_io.sheets_manager import (
 from logic.milp_allocator_v3 import generate_full_plan_cpsat, DEFAULT_TIME_LIMIT
 from logic.back_sim import BackSimConfig, run_back_sim, summarize_conditions, check_priority_sections
 from logic.car_pool import section_label, LARGE_CAR_IDS, NORMAL_CAR_IDS
-from data_io.output_writer import write_plan_xlsx, SECTION_COLORS
+from data_io.output_writer import write_plan_xlsx, write_repaired_xlsx, SECTION_COLORS
 from data_io.plan_importer import (
     fetch_output_format_xlsx_from_google_sheet,
     import_participants_from_output_xlsx,
@@ -35,6 +35,7 @@ from validator import (
 CREDENTIALS_PATH = "credentials.json"
 OUTPUT_XLSX_PATH = "hakone_result.xlsx"
 BACK_OUTPUT_XLSX_PATH = "hakone_result_back.xlsx"
+REPAIR_OUTPUT_XLSX_PATH = "hakone_result_repaired.xlsx"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 APP_VERSION = "v3-cpsat-2026-09-17"
@@ -309,16 +310,11 @@ def _render_car_assignment_table(plan, participants, key_prefix):
     _render_section_color_legend()
 
 
-def _render_back_sim_section():
-    """裏シュミ(追加条件での再調整)。表シュミを実行していなくても、表シュミ出力形式の
-    xlsxファイルを直接アップロードすれば単独で使える。"""
-    st.subheader("🔧 裏シュミ（追加条件で再調整）")
-    st.caption(
-        "既存の配車結果を土台に、「できるだけ一緒にしたい」「離したい」「運転区間数の範囲」を"
-        "追加のお願いとして加え、既存の割り当てをできるだけ変えずに調整します。"
-        "免許・定員などの必須条件や、表シュミ側の希望(特に「特に走りたい区間」)はここでの新しい条件より優先されます。"
-    )
-
+def _select_source_plan(key_prefix: str):
+    """表シュミの出力形式(入力データ／区間別ランナー／区間別配車の3シート)のファイルや
+    スプレッドシートを選んでplan/participantsを復元する、入力元選択UI。裏シュミ・修理の
+    どちらからも同じ部品を使う(key_prefixでウィジェットキーの衝突を避ける)。
+    選べていなければ(None, None)を返す。"""
     has_forward_result = bool(st.session_state.get("result"))
     has_saved_output = os.path.exists(OUTPUT_XLSX_PATH)
 
@@ -330,7 +326,7 @@ def _render_back_sim_section():
     source_options.append("表シュミの結果xlsxをアップロード")
     source_options.append("表シュミの結果と同じ形式のスプレッドシートのURLを指定")
 
-    source = st.radio("入力元", source_options, horizontal=True, key="back_source")
+    source = st.radio("入力元", source_options, horizontal=True, key=f"{key_prefix}_source")
 
     plan = None
     participants = None
@@ -350,7 +346,7 @@ def _render_back_sim_section():
         sheet_url = st.text_input(
             "スプレッドシートのURL（入力データ／区間別ランナー／区間別配車の3シートを含む、"
             "「リンクを知っている全員が閲覧可」に共有されたもの）",
-            key="back_sheet_url",
+            key=f"{key_prefix}_sheet_url",
         )
         if sheet_url:
             try:
@@ -363,7 +359,7 @@ def _render_back_sim_section():
     else:
         uploaded = st.file_uploader(
             "表シュミが出力したxlsxファイル（入力データ／区間別ランナー／区間別配車の3シートを含むもの）",
-            type=["xlsx"], key="back_uploaded_file",
+            type=["xlsx"], key=f"{key_prefix}_uploaded_file",
         )
         if uploaded is not None:
             try:
@@ -374,6 +370,56 @@ def _render_back_sim_section():
             except Exception as e:
                 st.error(f"ファイルの読み込みに失敗しました。表シュミの出力形式のxlsxか確認してください。\n\n{e}")
 
+    return plan, participants
+
+
+def _render_repair_section():
+    """修理: 表シュミ・裏シュミの出力と同じ形式のファイル/スプレッドシートを読み込み、
+    人員の交代や入力データとの不整合の調整は一切せず、同じ4シート構成のExcelを
+    数式を使わずに書き出し直す。区間別配車のセルの色分け・「先行」列は裏シュミのUIの
+    区間別配車タブと同じ(compute_car_table_overridesを共用)。"""
+    st.subheader("🔧 修理（数式を使わず同じ形式で書き出し直す）")
+    st.caption(
+        "区間別配車・区間別ランナーをドラッグ移動などで手動編集すると、個人別まとめの数式が"
+        "壊れて「重複」の誤検知や#N/Aが出ることがあります。この機能は人員の交代や入力データとの"
+        "不整合の調整は一切行わず、今の内容をそのまま、数式を使わない同じ形式のExcelファイルとして"
+        "書き出し直すだけです。"
+    )
+
+    plan, participants = _select_source_plan("repair")
+    if plan is None or participants is None:
+        st.info("修理するには、上で入力元を指定してください。")
+        return
+
+    if st.button("🔧 修理を実行", type="primary", key="repair_run"):
+        write_repaired_xlsx(plan, participants, REPAIR_OUTPUT_XLSX_PATH)
+        st.session_state.repair_result = {"plan": plan, "participants": participants}
+
+    repair_result = st.session_state.get("repair_result")
+    if repair_result:
+        st.success("修理済みのファイルを作成しました。")
+        with st.expander("🚘 区間別配車（Excelの「区間別配車」シートと同じ形式）"):
+            _render_car_assignment_table(repair_result["plan"], repair_result["participants"], key_prefix="repair")
+        if os.path.exists(REPAIR_OUTPUT_XLSX_PATH):
+            with open(REPAIR_OUTPUT_XLSX_PATH, "rb") as f:
+                st.download_button(
+                    "📊 修理済みExcelをダウンロード", f,
+                    file_name=os.path.basename(REPAIR_OUTPUT_XLSX_PATH),
+                    mime=XLSX_MIME, type="primary", key="repair_download",
+                )
+
+
+def _render_back_sim_section():
+    """裏シュミ(追加条件での再調整)。表シュミを実行していなくても、表シュミ出力形式の
+    xlsxファイルを直接アップロードすれば単独で使える。"""
+    st.subheader("🔧 裏シュミ（追加条件で再調整）")
+    st.caption(
+        "既存の配車結果を土台に、「できるだけ一緒にしたい」「離したい」「運転区間数の範囲」を"
+        "追加のお願いとして加え、既存の割り当てをできるだけ変えずに調整します。"
+        "免許・定員などの必須条件や、表シュミ側の希望(特に「特に走りたい区間」)はここでの新しい条件より優先されます。"
+    )
+
+    plan, participants = _select_source_plan("back")
     if plan is None or participants is None:
         st.info("裏シュミを実行するには、上で入力元を指定してください。")
         return
@@ -851,6 +897,9 @@ if result:
 
     with st.expander("詳細ログ"):
         st.text(result["log"])
+
+st.divider()
+_render_repair_section()
 
 # --- 裏シュミへの入口(ページ最後のドット) ---
 # 表シュミの結果はここに来るまでのスクリプト実行で既に確定しているので、そのまま使える。

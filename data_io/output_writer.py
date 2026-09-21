@@ -603,6 +603,145 @@ def write_plan_xlsx(plan: List[SectionState], participants: Dict[str, Participan
     return output_path
 
 
+def _compute_individual_summary_static(
+    plan: List[SectionState], participants: Dict[str, Participant]
+) -> Dict[str, Dict[str, str]]:
+    """個人別まとめの内容を、数式ではなくPythonでその場計算する(「修理」機能専用)。
+    区間別配車・区間別ランナーの両方に同じ人がいる「重複」の検知も、write_plan_xlsx側の
+    数式版(_individual_visible_formula)と同じルールで行う: ランナー・運転手・同乗者の
+    うち2つ以上に該当したら「⚠️重複: ...」にする。"""
+    summary: Dict[str, Dict[str, str]] = {pid: {} for pid in participants}
+    for section in plan:
+        label = section_label(section.section_id)
+        is_runner = {pid for pid in section.runner_ids if pid in participants}
+        driver_car: Dict[str, str] = {}
+        passenger_car: Dict[str, str] = {}
+        for car in section.cars:
+            if car.driver_id in participants and car.driver_id not in driver_car:
+                driver_car[car.driver_id] = car.car_id
+            for pid in car.passenger_ids:
+                if pid in participants and pid not in passenger_car:
+                    passenger_car[pid] = car.car_id
+
+        for pid in is_runner | set(driver_car) | set(passenger_car):
+            rf = pid in is_runner
+            dc = driver_car.get(pid)
+            pc = passenger_car.get(pid)
+            if sum([rf, dc is not None, pc is not None]) >= 2:
+                parts = []
+                if rf:
+                    parts.append("ランナー")
+                if dc:
+                    parts.append(f"運転手({dc})")
+                if pc:
+                    parts.append(f"同乗者({pc})")
+                summary[pid][label] = "⚠️重複: " + " ".join(parts)
+            elif rf:
+                summary[pid][label] = "🏃 ランナー"
+            elif dc:
+                summary[pid][label] = f"🚘 運転手({dc})"
+            elif pc:
+                summary[pid][label] = f"👥 同乗者({pc})"
+
+    label_1, label_2 = section_label(1), section_label(2)
+    for per_section in summary.values():
+        if label_1 not in per_section and per_section.get(label_2, "").startswith("🏃"):
+            per_section[label_1] = "現地集合"
+    return summary
+
+
+def _write_individual_sheet_static(ws, plan: List[SectionState], participants: Dict[str, Participant]) -> None:
+    """個人別まとめを、数式を一切使わずにその場の内容をそのまま書き込む(「修理」機能専用)。
+    write_plan_xlsx側の数式版(_write_individual_sheet)とは別実装で、区間別配車・
+    区間別ランナーを手で編集しても自動更新はされない代わり、セルのドラッグ移動などの
+    構造変更で数式が壊れる問題自体が起こらない。"""
+    sections = [(s, section_label(s)) for s in list(range(1, 11)) + [11]]
+    header = ["名前"] + [lbl for _, lbl in sections]
+    n_cols = len(header)
+
+    ws.append(header)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.border = THIN_BORDER
+
+    summary = _compute_individual_summary_static(plan, participants)
+    used_car_ids = [c for c in ALL_CAR_IDS if c in {car.car_id for section in plan for car in section.cars}]
+    driver_fills, passenger_fills = _build_car_fills(used_car_ids)
+
+    def _cell_fill(text: str) -> PatternFill:
+        if text.startswith("⚠️重複"):
+            return FILL_RED
+        if text == "現地集合":
+            return FILL_LOCAL_JOIN
+        if text.startswith("🏃"):
+            return FILL_RUNNER
+        if text.startswith("🚘"):
+            for car_id, fill in driver_fills.items():
+                if f"運転手({car_id})" in text:
+                    return fill
+        if text.startswith("👥"):
+            for car_id, fill in passenger_fills.items():
+                if f"同乗者({car_id})" in text:
+                    return fill
+        return FILL_WHITE
+
+    for pid, p in participants.items():
+        row_values = [p.name] + [summary.get(pid, {}).get(label, "") for _, label in sections]
+        ws.append(row_values)
+        r = ws.max_row
+        ws.cell(row=r, column=1).border = THIN_BORDER
+        for i in range(len(sections)):
+            cell = ws.cell(row=r, column=2 + i)
+            cell.border = THIN_BORDER
+            cell.fill = _cell_fill(cell.value or "")
+
+    legend_col = n_cols + GAP_COLS
+    _add_legend(ws, 1, legend_col, INDIVIDUAL_LEGEND)
+    if used_car_ids:
+        car_legend_items = []
+        for car_id in used_car_ids:
+            car_legend_items.append((driver_fills[car_id], f"＝{car_id} 運転手"))
+            car_legend_items.append((passenger_fills[car_id], f"＝{car_id} 同乗者"))
+        _add_legend(ws, len(INDIVIDUAL_LEGEND) + 3, legend_col, car_legend_items, title="車ごとの色")
+
+
+def write_repaired_xlsx(plan: List[SectionState], participants: Dict[str, Participant], output_path: str) -> str:
+    """「修理」機能専用の書き出し。write_plan_xlsx(表シュミ・裏シュミの出力)とは別物で、
+    人員の交代や入力データとの不整合の調整は一切行わず、与えられたplanをそのまま同じ
+    4シート構成のExcelとして書き出す。区間別配車の色分け・「先行」列はwrite_plan_xlsxと
+    同じcompute_car_table_overridesを使うため見た目は同じになるが、個人別まとめだけは
+    数式を使わずその場計算した値を直接書き込む(理由は_write_individual_sheet_staticの
+    コメント参照)。"""
+    wb = Workbook()
+
+    ws_input = wb.active
+    ws_input.title = "入力データ"
+    _write_input_sheet(ws_input, participants)
+    _autosize(ws_input)
+    ws_input.freeze_panes = "B2"
+
+    ws_runners = wb.create_sheet("区間別ランナー")
+    _, runners_memo_col = _write_runners_sheet(ws_runners, plan, participants)
+    _autosize(ws_runners)
+    ws_runners.column_dimensions[get_column_letter(runners_memo_col)].width = 30
+    ws_runners.freeze_panes = "B2"
+
+    ws_cars = wb.create_sheet("区間別配車")
+    _, cars_memo_col = _write_cars_sheet(ws_cars, plan, participants)
+    _autosize(ws_cars)
+    ws_cars.column_dimensions[get_column_letter(cars_memo_col)].width = 30
+    ws_cars.freeze_panes = "C2"
+
+    ws_individual = wb.create_sheet("個人別まとめ")
+    _write_individual_sheet_static(ws_individual, plan, participants)
+    _autosize(ws_individual)
+    ws_individual.freeze_panes = "B2"
+
+    wb.save(output_path)
+    print(f"\n✅ 修理済みExcelファイル '{output_path}' を作成しました（数式なし・入力データとの不整合調整なし）。")
+    return output_path
+
+
 def _normalize_expr(ref: str) -> str:
     """名前セルの表記ゆれを吸収する正規化の数式断片を作る。
     「山田太郎（4区も走る）」のような括弧以降の注記を切り捨て、「山田　太郎」のような
